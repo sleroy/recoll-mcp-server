@@ -1,102 +1,57 @@
 # Recoll MCP Server
 
-Natural language interface to your Recoll-indexed filesystem through Claude Desktop.
+Read-only MCP tools for a local [Recoll](https://www.recoll.org/) index. The
+server uses Recoll's Python bindings for search and text extraction, including
+PDF and Office documents supported by the local Recoll installation.
 
-## Overview
+## Setup
 
-This MCP (Model Context Protocol) server gives Claude AI access to your Recoll search index, enabling natural language queries of your entire indexed filesystem.
+Install Recoll, its Python bindings, and the extractors needed for your file
+types. Build a Recoll index first. Then create a virtual environment with the
+same Python version as the Recoll bindings:
 
-## Features
-
-- **Natural Language Search**: Ask Claude to find files using plain English
-- **Advanced Filtering**: Search by date range, file type, and more
-- **Content Access**: Retrieve full document contents
-- **Recent Files**: List recently modified files
-- **Fast**: Direct access to Xapian index via Recoll Python API
-
-## Requirements
-
-- Python 3.10+
-- Recoll (with Python bindings)
-- Claude Desktop
-- MCP Python SDK
-
-## Installation
-
-1. Install dependencies:
-```bash
-pip install mcp
-# Recoll Python bindings are usually included with recoll package
+```sh
+uv venv --python /usr/bin/python3 --system-site-packages .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-2. Configure Claude Desktop:
+Set `RECOLL_CONFDIR` to the Recoll index configuration directory and
+`RECOLL_ALLOWED_ROOT` to the document tree the server may expose. The server
+will return only indexed files under that root. Its tools do not write files.
 
-Edit `~/.config/claude/claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "recoll-search": {
-      "command": "python3",
-      "args": [
-        "/home/sam/src/recoll-mcp-server/recoll_mcp_server.py"
-      ],
-      "env": {
-        "RECOLL_CONFDIR": "/home/sam/.config/recoll"
-      }
-    }
-  }
-}
+```sh
+RECOLL_CONFDIR="$HOME/.recoll" \
+RECOLL_ALLOWED_ROOT="$HOME/Documents" \
+.venv/bin/python recoll_mcp_server.py
 ```
 
-3. Restart Claude Desktop
+The server uses MCP over stdio. Configure your MCP client with the Python
+executable and this script as arguments, and set the two environment variables
+above. For example:
 
-## Usage Examples
+```sh
+codex mcp add recoll-search \
+  --env RECOLL_CONFDIR="$HOME/.recoll" \
+  --env RECOLL_ALLOWED_ROOT="$HOME/Documents" \
+  -- "$PWD/.venv/bin/python" "$PWD/recoll_mcp_server.py"
+```
 
-Once configured, you can ask Claude:
+## Tools
 
-- "Find my notes about YubiKey from December"
-- "Search for PDFs containing 'machine learning'"
-- "Show me files I modified this week"
-- "Find markdown files about Nextcloud"
+- `search_filesystem(query, max_results=10)` returns indexed paths, MIME types,
+  document IDs, and short previews. Recoll query syntax supports Boolean terms,
+  quoted phrases, and wildcards. At most 20 results are returned per call.
+- `get_document_content(document_id, max_chars=12000)` extracts text from one
+  indexed hit. At most 20,000 characters are returned, and sources larger than
+  25 MB are refused.
 
-## Available Tools
-
-### search_filesystem
-Search using keywords or phrases with Boolean operators (AND, OR, NOT).
-
-### search_by_date
-Filter results by modification date range.
-
-### search_by_filetype
-Filter by file type/mimetype (pdf, markdown, text, etc.).
-
-### get_document_content
-Retrieve full content of a specific document.
-
-### list_recent_files
-List recently modified files in the index.
+Both tools check that the indexed file resolves under `RECOLL_ALLOWED_ROOT`.
+Document IDs must come from the configured index. An MCP client may send
+returned excerpts to its model provider, so treat the client configuration as
+having access to the indexed documents.
 
 ## Development
 
-Test the Recoll API directly:
-```bash
-python test_recoll_api.py
-```
-
-## Architecture
-
-```
-User (natural language)
-    ↓
-Claude Desktop (with MCP)
-    ↓
-Recoll MCP Server (Python)
-    ↓
-Recoll Python API
-    ↓
-Xapian Index (your filesystem)
-```
-
-## License
-
-Apache 2.0
+The server requires MCP Python SDK 1.x. The `requirements.txt` file pins its
+major version. The Recoll binding comes from the system package so it matches
+the system Recoll version.

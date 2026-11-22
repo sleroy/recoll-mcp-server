@@ -1,388 +1,87 @@
 #!/usr/bin/env python3
-"""
-Recoll MCP Server - Natural Language Interface to Indexed Filesystem
-
-Provides Claude with access to your Recoll-indexed filesystem through MCP.
-Supports natural language queries with semantic understanding.
-"""
+"""Read-only MCP access to a specific Recoll index."""
 
 import os
-import json
-import asyncio
-from datetime import datetime
-from typing import Any, Sequence
-from recoll import recoll
-from mcp.server.models import InitializationOptions
-from mcp.server import NotificationOptions, Server
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    Resource,
-    Tool,
-    TextContent,
-    ImageContent,
-    EmbeddedResource,
-)
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
-# Set Recoll config directory
-os.environ['RECOLL_CONFDIR'] = os.path.expanduser('~/.config/recoll')
-
-# Initialize Recoll database connection
-try:
-    db = recoll.connect()
-except Exception as e:
-    print(f"Warning: Could not connect to Recoll database: {e}", flush=True)
-    db = None
-
-# Create MCP server instance
-server = Server("recoll-search")
+from mcp.server.fastmcp import FastMCP
+from recoll import recoll, rclextract
 
 
-def format_doc_result(doc: Any, include_preview: bool = True) -> dict:
-    """Format a Recoll document result as a structured dict."""
-    result = {
-        "filename": doc.filename,
+CONFIG_DIR = Path(os.environ.get("RECOLL_CONFDIR", "~/.recoll")).expanduser().resolve()
+ALLOWED_ROOT = Path(os.environ.get("RECOLL_ALLOWED_ROOT", "~")).expanduser().resolve()
+server = FastMCP("recoll-search")
+
+
+def _inside_allowed_root(doc) -> bool:
+    parsed = urlsplit(doc.url)
+    if parsed.scheme != "file":
+        return False
+    path = Path(unquote(parsed.path)).resolve()
+    return path.is_relative_to(ALLOWED_ROOT)
+
+
+def _connection():
+    return recoll.connect(confdir=str(CONFIG_DIR))
+
+
+@server.tool()
+def search_filesystem(query: str, max_results: int = 10) -> dict:
+    """Search indexed documents with Recoll syntax. Returns paths and short previews.
+
+    Use AND, OR, quoted phrases, and wildcards. Search only covers the configured
+    Recoll index and the allowed root directory. No files are changed.
+    """
+    if not query or len(query) > 500:
+        raise ValueError("query must be between 1 and 500 characters")
+    limit = max(1, min(int(max_results), 20))
+    db = _connection()
+    cursor = db.query()
+    total = cursor.execute(query)
+    results = []
+    for _ in range(min(total, 200)):
+        doc = cursor.fetchone()
+        if _inside_allowed_root(doc):
+            results.append({
+                "document_id": doc.rcludi,
+                "filename": doc.filename,
+                "url": doc.url,
+                "mimetype": doc.mimetype,
+                "preview": (doc.abstract or "")[:500],
+            })
+        if len(results) >= limit:
+            break
+    return {"query": query, "total_results": total, "results": results}
+
+
+@server.tool()
+def get_document_content(document_id: str, max_chars: int = 12000) -> dict:
+    """Extract bounded text from a document_id returned by search_filesystem.
+
+    Handles PDFs and Office documents through Recoll's own extractors. The
+    document must belong to the configured index and allowed root directory.
+    """
+    if not document_id or len(document_id) > 2000:
+        raise ValueError("invalid document_id")
+    limit = max(1, min(int(max_chars), 20000))
+    db = _connection()
+    doc = db.getDoc(document_id)
+    if doc is None or not _inside_allowed_root(doc):
+        raise ValueError("document is outside the allowed index")
+    parsed = urlsplit(doc.url)
+    path = Path(unquote(parsed.path)).resolve()
+    if path.stat().st_size > 25_000_000:
+        raise ValueError("source file is too large for MCP text extraction")
+    extracted = rclextract.Extractor(doc).textextract(doc.ipath)
+    content = extracted.text or ""
+    return {
+        "document_id": document_id,
         "url": doc.url,
-        "mimetype": doc.mimetype,
-        "size": doc.fbytes,
-        "mtime": doc.mtime,
-        "mtime_readable": datetime.fromtimestamp(int(doc.mtime[1:])).strftime("%Y-%m-%d %H:%M:%S"),
+        "content": content[:limit],
+        "truncated": len(content) > limit,
     }
-
-    if include_preview and hasattr(doc, 'abstract'):
-        result["preview"] = doc.abstract[:300]
-
-    return result
-
-
-@server.list_tools()
-async def handle_list_tools() -> list[Tool]:
-    """List available Recoll search tools."""
-    return [
-        Tool(
-            name="search_filesystem",
-            description="""Search the indexed filesystem using keywords or phrases.
-            Supports Boolean queries (AND, OR, NOT), phrase searches ("exact phrase"),
-            and wildcards. Results are ranked by relevance or sorted by date.
-
-            Examples:
-            - "todo yubikey" - finds documents with both terms
-            - "blog OR post" - finds documents with either term
-            - '"exact phrase"' - finds exact phrase match
-            - "python NOT django" - excludes documents with django
-            """,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query using Recoll syntax (keywords, Boolean operators, phrases)",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 20)",
-                        "default": 20,
-                    },
-                    "include_preview": {
-                        "type": "boolean",
-                        "description": "Include content preview/abstract in results (default: true)",
-                        "default": True,
-                    },
-                    "sort_by": {
-                        "type": "string",
-                        "description": "Sort order: 'relevance' (default), 'date_desc' (newest first), 'date_asc' (oldest first)",
-                        "enum": ["relevance", "date_desc", "date_asc"],
-                        "default": "relevance",
-                    },
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="search_by_date",
-            description="""Search files filtered by modification date range.
-            Useful for finding recent documents or documents from a specific time period.
-
-            Examples:
-            - Find notes from last month
-            - Find documents modified in 2025
-            - Find files changed this week
-            """,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query (keywords)",
-                    },
-                    "start_date": {
-                        "type": "string",
-                        "description": "Start date in YYYY-MM-DD format (optional)",
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "End date in YYYY-MM-DD format (optional)",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 20)",
-                        "default": 20,
-                    },
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="search_by_filetype",
-            description="""Search files filtered by file type/mimetype.
-
-            Common types:
-            - "pdf" or "application/pdf" - PDF documents
-            - "text" or "text/*" - All text files
-            - "markdown" or "text/markdown" - Markdown files
-            - "doc" or "application/msword" - Word documents
-            - "image" or "image/*" - All images
-            """,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query (keywords)",
-                    },
-                    "filetype": {
-                        "type": "string",
-                        "description": "File type filter (e.g., 'pdf', 'markdown', 'text', 'image')",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 20)",
-                        "default": 20,
-                    },
-                },
-                "required": ["query", "filetype"],
-            },
-        ),
-        Tool(
-            name="get_document_content",
-            description="""Retrieve the full content of a document by its file URL.
-            Use this after a search to get the complete text of a specific document.
-            """,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "File URL from search results (file:///path/to/file)",
-                    },
-                },
-                "required": ["url"],
-            },
-        ),
-        Tool(
-            name="list_recent_files",
-            description="""List recently modified files in the index.
-            Useful for seeing what's been recently updated.
-            """,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "days": {
-                        "type": "integer",
-                        "description": "Number of days back to search (default: 7)",
-                        "default": 7,
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 20)",
-                        "default": 20,
-                    },
-                },
-            },
-        ),
-    ]
-
-
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> Sequence[TextContent]:
-    """Handle tool calls for Recoll searches."""
-
-    if db is None:
-        return [TextContent(
-            type="text",
-            text="Error: Recoll database not available. Check configuration."
-        )]
-
-    try:
-        if name == "search_filesystem":
-            query_str = arguments["query"]
-            max_results = arguments.get("max_results", 20)
-            include_preview = arguments.get("include_preview", True)
-            sort_by = arguments.get("sort_by", "relevance")
-
-            query = db.query()
-            if sort_by == "date_desc":
-                query.sortby(field="mtime", ascending=False)
-            elif sort_by == "date_asc":
-                query.sortby(field="mtime", ascending=True)
-            nres = query.execute(query_str)
-
-            results = []
-            for i in range(min(max_results, nres)):
-                doc = query.fetchone()
-                results.append(format_doc_result(doc, include_preview))
-
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "query": query_str,
-                    "total_results": nres,
-                    "returned_results": len(results),
-                    "results": results
-                }, indent=2)
-            )]
-
-        elif name == "search_by_date":
-            query_str = arguments["query"]
-            start_date = arguments.get("start_date")
-            end_date = arguments.get("end_date")
-            max_results = arguments.get("max_results", 20)
-
-            # Build date filter
-            date_filter = ""
-            if start_date and end_date:
-                date_filter = f" date:{start_date}/{end_date}"
-            elif start_date:
-                date_filter = f" date:{start_date}/"
-            elif end_date:
-                date_filter = f" date:/{end_date}"
-
-            full_query = query_str + date_filter
-
-            query = db.query()
-            nres = query.execute(full_query)
-
-            results = []
-            for i in range(min(max_results, nres)):
-                doc = query.fetchone()
-                results.append(format_doc_result(doc))
-
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "query": full_query,
-                    "total_results": nres,
-                    "returned_results": len(results),
-                    "results": results
-                }, indent=2)
-            )]
-
-        elif name == "search_by_filetype":
-            query_str = arguments["query"]
-            filetype = arguments["filetype"]
-            max_results = arguments.get("max_results", 20)
-
-            # Build type filter
-            full_query = f"{query_str} mime:{filetype}"
-
-            query = db.query()
-            nres = query.execute(full_query)
-
-            results = []
-            for i in range(min(max_results, nres)):
-                doc = query.fetchone()
-                results.append(format_doc_result(doc))
-
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "query": full_query,
-                    "total_results": nres,
-                    "returned_results": len(results),
-                    "results": results
-                }, indent=2)
-            )]
-
-        elif name == "get_document_content":
-            url = arguments["url"]
-
-            # Extract file path from URL
-            if url.startswith("file://"):
-                filepath = url[7:]
-            else:
-                filepath = url
-
-            # Read file content
-            try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-
-                return [TextContent(
-                    type="text",
-                    text=json.dumps({
-                        "url": url,
-                        "filepath": filepath,
-                        "content": content[:10000],  # Limit to first 10k chars
-                        "truncated": len(content) > 10000
-                    }, indent=2)
-                )]
-            except Exception as e:
-                return [TextContent(
-                    type="text",
-                    text=f"Error reading file: {e}"
-                )]
-
-        elif name == "list_recent_files":
-            days = arguments.get("days", 7)
-            max_results = arguments.get("max_results", 20)
-
-            # Search for files modified in last N days
-            query = db.query()
-            nres = query.execute(f"date:{days}d/")
-
-            results = []
-            for i in range(min(max_results, nres)):
-                doc = query.fetchone()
-                results.append(format_doc_result(doc))
-
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "days": days,
-                    "total_results": nres,
-                    "returned_results": len(results),
-                    "results": results
-                }, indent=2)
-            )]
-
-        else:
-            return [TextContent(
-                type="text",
-                text=f"Unknown tool: {name}"
-            )]
-
-    except Exception as e:
-        return [TextContent(
-            type="text",
-            text=f"Error executing search: {str(e)}"
-        )]
-
-
-async def main():
-    """Run the Recoll MCP server."""
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="recoll-search",
-                server_version="1.0.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    server.run(transport="stdio")
